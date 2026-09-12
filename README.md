@@ -8,7 +8,8 @@ whatever model or agent you already use, and it hands back grounded UE5 context 
 to answer from. Everything runs on CPU; the embedding model is ~146 MB.
 
 ## What's in this repo
-<img width="1024" height="572" alt="b652b9d824e7498fa64d19d2596ddce6" src="https://github.com/user-attachments/assets/3e54fdf2-f455-4fcb-bece-2ee97f502bab" />
+<img width="1024" height="572" alt="clean_watermarked_img_16063312466734765330 (1)" src="https://github.com/user-attachments/assets/d0fd89ef-0f49-43e2-bb30-84fed01f1c3d" />
+
 
 
 
