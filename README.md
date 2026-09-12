@@ -8,18 +8,20 @@ whatever model or agent you already use, and it hands back grounded UE5 context 
 to answer from. Everything runs on CPU; the embedding model is ~146 MB.
 
 ## What's in this repo
+<img width="1024" height="572" alt="image" src="https://github.com/user-attachments/assets/6e66106b-0e74-496e-bd08-b5ca49538dfa" />
 
 | File | What it is |
 |---|---|
 | `ue5_faiss_v4.index` | FAISS vector index of embedded documentation chunks |
 | `ue5_chunks_v4.json` | The text/metadata for each chunk, in the same order as the FAISS index |
 | `ue5_knowledge_graph_v4.graphml` | NetworkX graph connecting UE5 classes, subsystems, and functions |
-| `ue5_images_v4/` | Diagrams/screenshots from the source docs, referenced by the chunks that use them |
-| `UnrealDocu.py` | The scraper that built the four files above, plus the retrieval functions used below |
 
-Keep all of the above in the same folder — chunk records reference the images folder by
-relative path, and the FAISS index only lines up with `ue5_chunks_v4.json` if both are loaded
-from where they were saved together.
+The embedding model and the reference images are hosted separately (see Setup below) — this
+keeps the GitHub repo small, since neither fits comfortably in a git repo.
+
+Keep everything in the same folder once you've downloaded it all — chunk records reference the
+images folder by relative path, and the FAISS index only lines up with `ue5_chunks_v4.json` if
+both are loaded together, as saved.
 
 ## Setup (do this once, regardless of what you connect it to)
 
@@ -30,35 +32,115 @@ model puts queries in a different vector space and retrieval will return nonsens
 Download: **https://huggingface.co/Volium/snowflake-arctic-embed-m-long-q8_0.GGUF**
 (direct file, 146 MB: [`.../resolve/main/snowflake-arctic-embed-m-long-q8_0.gguf`](https://huggingface.co/Volium/snowflake-arctic-embed-m-long-q8_0.GGUF/resolve/main/snowflake-arctic-embed-m-long-q8_0.gguf))
 
-Put it in a `models/` folder next to your code, or point straight at it:
+Put it in a `models/` folder next to your code.
+
+**2. Get the reference images.** Diagrams/screenshots from the source docs ship as
+`UE5_images.rar` on the same Hugging Face repo as the embedding model:
+**https://huggingface.co/Volium/snowflake-arctic-embed-m-long-q8_0.GGUF**
+
+Download it and extract it into the same folder as `ue5_faiss_v4.index`/`ue5_chunks_v4.json` —
+extracting it should produce a `ue5_images_v4/` subfolder there (any archive tool works: 7-Zip,
+WinRAR, `unrar x UE5_images.rar`, etc.). If you don't need image grounding, you can skip this —
+everything else works without it, you'll just get an empty image list from that part of the API.
+
+**3. Install dependencies.**
 
 ```bash
-# Windows (PowerShell)
-$env:APP_MODELS_DIR = "C:\path\to\snowflake-arctic-embed-m-long-q8_0.gguf"
-# macOS / Linux
-export APP_MODELS_DIR=/path/to/snowflake-arctic-embed-m-long-q8_0.gguf
+pip install faiss-cpu llama-cpp-python numpy networkx
 ```
 
-**2. Install dependencies.**
-
-```bash
-pip install faiss-cpu llama-cpp-python numpy networkx requests beautifulsoup4
-```
-
-(`requests`/`beautifulsoup4` are only used by the scraper half of `UnrealDocu.py`, but Python
-imports the whole file top-to-bottom the moment you import anything from it, so they're required
-even if you only ever call the two functions below.)
-
-**3. Confirm it works.**
+**4. Save the retrieval helper.** This repo intentionally doesn't ship a scraper or any serving
+code — just the three data files above. Save this as `ue5_retrieve.py` in the same folder:
 
 ```python
-from UnrealDocu import build_lightrag_context
-print(build_lightrag_context("How do I enable Lumen via Python?", top_k=3))
+import json
+import numpy as np
+import faiss
+import networkx as nx
+from llama_cpp import Llama
+
+MODEL_PATH       = "models/snowflake-arctic-embed-m-long-q8_0.gguf"   # point at your download
+FAISS_INDEX_FILE = "ue5_faiss_v4.index"
+CHUNK_JSON_FILE  = "ue5_chunks_v4.json"
+GRAPH_FILE       = "ue5_knowledge_graph_v4.graphml"
+
+_model = Llama(model_path=MODEL_PATH, embedding=True, n_ctx=1024, n_gpu_layers=0, verbose=False)
+_index = faiss.read_index(FAISS_INDEX_FILE)
+with open(CHUNK_JSON_FILE, "r", encoding="utf-8") as f:
+    _chunks = json.load(f)
+_graph = nx.read_graphml(GRAPH_FILE)
+
+# Map each graph node's human-readable label -> its node id. We don't need to
+# know how those ids were generated, just that every node carries a "name"
+# (entities) or "title" (pages) attribute holding the real text.
+_name_to_node = {}
+for _nid, _data in _graph.nodes(data=True):
+    _label = _data.get("name") or _data.get("title")
+    if _label:
+        _name_to_node.setdefault(_label, _nid)
+
+
+def embed(text: str) -> np.ndarray:
+    vec = np.array(_model.embed(text), dtype=np.float32)
+    if vec.ndim > 1:
+        vec = vec.mean(axis=0)          # some pooling configs return one row per token
+    norm = np.linalg.norm(vec)
+    return vec / norm if norm > 0 else vec
+
+
+def graph_context(entities: list, hops: int = 2) -> list:
+    lines, frontier, seen = [], [], set()
+    for e in entities:
+        nid = _name_to_node.get(e)
+        if nid:
+            frontier.append(nid)
+            seen.add(nid)
+    for _ in range(hops):
+        nxt = []
+        for nid in frontier:
+            src_label = _graph.nodes[nid].get("name") or _graph.nodes[nid].get("title")
+            for _, dst, edata in _graph.out_edges(nid, data=True):
+                dst_label = _graph.nodes[dst].get("name") or _graph.nodes[dst].get("title")
+                lines.append(f"{src_label} -[{edata.get('relation', 'related_to')}]-> {dst_label}")
+                if dst not in seen:
+                    seen.add(dst)
+                    nxt.append(dst)
+        frontier = nxt
+    return lines
+
+
+def retrieve(query: str, top_k: int = 5, graph_hops: int = 2, with_images: bool = False):
+    q = embed(query).reshape(1, -1)
+    scores, idxs = _index.search(q, top_k)
+    hits = [_chunks[i] for i in idxs[0] if 0 <= i < len(_chunks)]
+
+    parts = [f"[{i + 1}] ({h['url']}) {h['text']}" for i, h in enumerate(hits)]
+    all_entities = {e for h in hits for e in h.get("entities", [])}
+    lines = graph_context(list(all_entities), hops=graph_hops)
+    if lines:
+        parts.append("## Connected Concepts:\n" + "\n".join(lines))
+    ctx = "\n\n".join(parts)
+
+    if not with_images:
+        return ctx
+
+    image_paths = []
+    for h in hits:
+        for img in h.get("images", []):
+            if img["path"] not in image_paths:
+                image_paths.append(img["path"])
+    return ctx, image_paths
 ```
 
-⚠️ **If step 1 wasn't done correctly, this prints an empty string instead of erroring** — no
-embedding model found means retrieval silently returns nothing rather than crashing. If you get
-`""` back, that's the first thing to check, not a bug in the code below.
+**5. Confirm it works.**
+
+```python
+from ue5_retrieve import retrieve
+print(retrieve("How do I enable Lumen via Python?", top_k=3))
+```
+
+⚠️ **If step 1 wasn't done correctly, this raises an error from `llama_cpp` (bad model path)
+rather than silently returning nothing** — that's the first thing to check if this doesn't work.
 
 That's the whole retrieval API. Everything below is just different ways to put that string in
 front of a model.
@@ -82,11 +164,11 @@ of you pasting context in by hand every time.
 pip install fastmcp
 ```
 
-Save this as `ue5_mcp_server.py` in the same folder as the data files:
+Save this as `ue5_mcp_server.py` in the same folder as `ue5_retrieve.py`:
 
 ```python
 from fastmcp import FastMCP
-from UnrealDocu import build_lightrag_context, build_lightrag_context_with_images
+from ue5_retrieve import retrieve
 
 mcp = FastMCP("ue5-lightrag")
 
@@ -94,13 +176,13 @@ mcp = FastMCP("ue5-lightrag")
 def search_ue5_docs(query: str, top_k: int = 5) -> str:
     """Search Unreal Engine 5 documentation and return grounded context
     (relevant chunks + connected knowledge-graph concepts) for the query."""
-    return build_lightrag_context(query, top_k=top_k, graph_hops=2)
+    return retrieve(query, top_k=top_k, graph_hops=2)
 
 @mcp.tool()
 def search_ue5_docs_with_images(query: str, top_k: int = 5) -> dict:
     """Same as search_ue5_docs, plus local file paths of any diagrams/
     screenshots attached to the retrieved chunks."""
-    ctx, image_paths = build_lightrag_context_with_images(query, top_k=top_k)
+    ctx, image_paths = retrieve(query, top_k=top_k, with_images=True)
     return {"context": ctx, "image_paths": image_paths}
 
 if __name__ == "__main__":
@@ -128,10 +210,9 @@ Windows: `%APPDATA%\Claude\claude_desktop_config.json`) and restart the app:
 }
 ```
 
-Use **absolute paths** for both the script and the model file (`APP_MODELS_DIR`) — MCP launches
-your script as a subprocess from wherever the client lives, not from this folder, so relative
-paths silently fail to resolve (see step 3's warning above — this is the most common way to hit
-that empty-string result).
+Use **absolute paths** everywhere — for the script, and for `MODEL_PATH` inside
+`ue5_retrieve.py` — MCP launches your script as a subprocess from wherever the client lives, not
+from this folder, so relative paths silently fail to resolve.
 
 ### Option B — A cloud API (Anthropic, OpenAI, or any chat-completions endpoint)
 
@@ -141,12 +222,12 @@ endpoints with no separate system field) before sending the request — standard
 **Anthropic:**
 
 ```python
-from UnrealDocu import build_lightrag_context
+from ue5_retrieve import retrieve
 import anthropic
 
 client = anthropic.Anthropic()   # reads ANTHROPIC_API_KEY from the environment
 user_query = "How do I enable Lumen via Python?"
-ctx = build_lightrag_context(user_query, top_k=5, graph_hops=2)
+ctx = retrieve(user_query, top_k=5, graph_hops=2)
 
 response = client.messages.create(
     model="claude-sonnet-5",
@@ -160,15 +241,15 @@ print(response.content[0].text)
 **OpenAI (or any OpenAI-compatible endpoint):**
 
 ```python
-from UnrealDocu import build_lightrag_context
+from ue5_retrieve import retrieve
 from openai import OpenAI
 
 client = OpenAI()   # reads OPENAI_API_KEY from the environment
 user_query = "How do I enable Lumen via Python?"
-ctx = build_lightrag_context(user_query, top_k=5, graph_hops=2)
+ctx = retrieve(user_query, top_k=5, graph_hops=2)
 
 response = client.chat.completions.create(
-    model="<your model>",   # e.g. whichever GPT model you currently have access to
+    model="<your model>",   # whichever model you currently have access to
     messages=[
         {"role": "system", "content": f"You are a UE5 automation assistant. Use this retrieved context when relevant:\n\n{ctx}"},
         {"role": "user", "content": user_query},
@@ -183,20 +264,19 @@ Any other provider follows one of these two shapes (separate `system` field, or 
 ### Option C — A local model or your own agent framework
 
 If you're running a local llama.cpp server, Ollama, or a custom agent loop, the integration is
-the same one line — `build_lightrag_context()` returns plain text, so it doesn't care what
-consumes it:
+the same one line — `retrieve()` returns plain text (or text + image paths), so it doesn't care
+what consumes it:
 
 ```python
-from UnrealDocu import build_lightrag_context_with_images
+from ue5_retrieve import retrieve
 
-ctx, image_paths = build_lightrag_context_with_images(user_query, top_k=5)
+ctx, image_paths = retrieve(user_query, top_k=5, with_images=True)
 # ctx          -> paste into your prompt template wherever "context" or "retrieved docs" goes
 # image_paths  -> local file paths; load and attach these if your model accepts image input
 ```
 
 For a vision-capable model, load each path in `image_paths` and attach it as an image content
-block alongside `ctx` — that's what `build_lightrag_context_with_images()` is for, versus the
-text-only `build_lightrag_context()`.
+block alongside `ctx`.
 
 ---
 
@@ -211,9 +291,13 @@ relative to `ue5_images_v4/`).
 extraction is regex-based pattern matching over the doc text, not a real parser of Unreal's
 class hierarchy — useful as a "what else is this connected to" hint, not ground truth.
 
-**Regenerating the corpus**: `python UnrealDocu.py` re-scrapes and rebuilds all four output
-files (it checkpoints, so an interrupted run resumes). Not needed for normal use — only if you
-want to refresh after Epic updates their docs, or extend coverage.
+**This is a static snapshot.** It reflects Epic's documentation as of whenever this corpus was
+built and won't pick up anything published after that. The tooling that generated it isn't part
+of this repo.
+
+**Source content**: text and images are derived from Epic Games' own Unreal Engine
+documentation — short excerpts and a modest number of diagrams, not a full mirror. Check Epic's
+documentation terms yourself before redistributing the corpus further.
 
 **Source content**: text and images are derived from Epic Games' own Unreal Engine
 documentation — short excerpts and a modest number of diagrams, not a full mirror. Check Epic's
