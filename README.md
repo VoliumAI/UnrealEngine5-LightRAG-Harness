@@ -8,11 +8,7 @@ whatever model or agent you already use, and it hands back grounded UE5 context 
 to answer from. Everything runs on CPU; the embedding model is ~146 MB.
 
 ## What's in this repo
-<img width="1678" height="937" alt="image" src="https://github.com/user-attachments/assets/bad51f3f-5ebb-4136-a97d-ff2cf5ffb7b4" />
-
-
-
-
+<img width="1678" height="937" alt="image" src="https://github.com/user-attachments/assets/56d73e72-300a-4dd6-8aba-94797c87e1d4" />
 
 | File | What it is |
 |---|---|
@@ -42,10 +38,28 @@ Put it in a `models/` folder next to your code.
 `UE5_images.rar` on the same Hugging Face repo as the embedding model:
 **https://huggingface.co/Volium/snowflake-arctic-embed-m-long-q8_0.GGUF**
 
-Download it and extract it into the same folder as `ue5_faiss_v4.index`/`ue5_chunks_v4.json` —
-extracting it should produce a `ue5_images_v4/` subfolder there (any archive tool works: 7-Zip,
-WinRAR, `unrar x UE5_images.rar`, etc.). If you don't need image grounding, you can skip this —
-everything else works without it, you'll just get an empty image list from that part of the API.
+The archive itself is flat — the image files sit at its root, with no `ue5_images_v4` folder
+already inside it. `ue5_chunks_v4.json` expects them to be found at `ue5_images_v4/<filename>`
+relative to wherever you run your code, so **you need to create that folder yourself and
+extract into it** — don't just "Extract Here" next to the other data files, or the images end up
+one level too shallow and every image path in the chunk data will fail to resolve.
+
+```bash
+# from the folder containing ue5_faiss_v4.index / ue5_chunks_v4.json
+mkdir ue5_images_v4
+# Linux/macOS with unrar:
+unrar x UE5_images.rar ue5_images_v4/
+# Windows with WinRAR/7-Zip: right-click UE5_images.rar -> "Extract to..." -> browse to (or
+# create) the ue5_images_v4 folder as the destination, rather than using "Extract Here"
+```
+
+Check afterward that images landed directly inside `ue5_images_v4/` (e.g.
+`ue5_images_v4/<some-hash>.jpg`) and not nested another level deeper in something like
+`ue5_images_v4/UE5_images/<some-hash>.jpg` — some GUI archive tools default to creating an extra
+subfolder named after the archive itself, which would need deleting/flattening.
+
+If you don't need image grounding, you can skip this entirely — everything else works without
+it, you'll just get an empty image list from that part of the API.
 
 **3. Install dependencies.**
 
@@ -298,10 +312,6 @@ class hierarchy — useful as a "what else is this connected to" hint, not groun
 **This is a static snapshot.** It reflects Epic's documentation as of whenever this corpus was
 built and won't pick up anything published after that. The tooling that generated it isn't part
 of this repo.
-
-**Source content**: text and images are derived from Epic Games' own Unreal Engine
-documentation — short excerpts and a modest number of diagrams, not a full mirror. Check Epic's
-documentation terms yourself before redistributing the corpus further.
 
 **Source content**: text and images are derived from Epic Games' own Unreal Engine
 documentation — short excerpts and a modest number of diagrams, not a full mirror. Check Epic's
